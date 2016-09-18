@@ -1,0 +1,745 @@
+/*  
+    Copyright (c) 2011, Salesforce.com Foundation
+    All rights reserved.
+    
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+    
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the Salesforce.com Foundation nor the names of
+      its contributors may be used to endorse or promote products derived
+      from this software without specific prior written permission.
+  
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS 
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE 
+    COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, 
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, 
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; 
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER 
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT 
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN 
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
+    POSSIBILITY OF SUCH DAMAGE.
+*/
+/**
+* @author Salesforce.com Foundation 
+* @date 2011 (2.0) 
+* @description Resposible for rollups of all opportunities to the requisite Account/Household/Contact 
+*/
+global virtual without sharing class OpportunityRollups{
+
+    /*** Constructor ***/
+    public OpportunityRollups(){
+        // setup households settings
+        OpportunityRollup_Utilities.setupRollupVars(Households.getHouseholdsSettings());
+        // setup user rollups
+        OpportunityRollup_Utilities.setupUserRollupVars();
+    }
+    /*************************************************************/  
+    
+    /*** Fired from trigger on Opp - determine which opps changed and pass the Con/Acc/HH IDs to the regular rollup methods ***/
+    public void rollupForOppTrigger( map<id, Opportunity> newOpps, map<id, Opportunity> oldOpps ) {
+        //opp ids for contact/hh querying
+        set<id> contactRequerySet = new set<id>();        
+        //opp ids for Account querying
+        set<id> accountRequerySet = new set<id>();        
+        
+        if (OpportunityRollup_Utilities.hh_settings.Enable_Opp_Rollup_Triggers__c){
+            //delete or insert            
+            if (newOpps == null || oldOpps == null){
+                for (id oid : (newOpps == null ? oldOpps.keySet() : newOpps.keySet())){
+                    Opportunity o = (newOpps == null ? oldOpps.get(oid) : newOpps.get(oid));
+                    if (OpportunityRollup_Utilities.oppForRollup(o)){
+                        if (OpportunityRollup_Utilities.needsAccountRollup(o)){
+                            accountRequerySet.add(o.AccountId);
+                        }                       
+                        if (OpportunityRollup_Utilities.needsContactRollup(o)){
+                            contactRequerySet.add(oid);
+                        }
+                    }    
+                }
+            }            
+            //update
+            else{
+                for (id oid : newOpps.keySet()){
+                   Opportunity newo = newOpps.get(oid);
+                   Opportunity oldo = oldOpps.get(oid);
+                   //if the new one is valid and there are differences between the two opps
+                   if (OpportunityRollup_Utilities.oppForRollup(newo, oldo)){
+                        if (OpportunityRollup_Utilities.needsAccountRollup(newo)){
+                            accountRequerySet.add(newo.AccountId);
+                        }                       
+                        if (OpportunityRollup_Utilities.needsContactRollup(newo)){
+                            contactRequerySet.add(oid);
+                        }
+                   }    
+                }
+            }
+        }            
+            
+        if (!accountRequerySet.isEmpty()){
+            map<id, Account> amap = new map<id, account>((list<Account>)Database.query(OpportunityRollup_Utilities.buildAccountQuery() + 
+                                                                        ' where id in :accountRequerySet'));            
+            //if we only need to rollup a single Account, do sync
+            if (amap.size() == 1){
+                rollupAccounts(amap);                               
+            }   
+            //do it @future
+            else if (Limits.getFutureCalls() < Limits.getLimitFutureCalls()){
+                rollupAccountsFuture(amap.keySet());
+            }                       
+        }
+        
+        //contacts needs to be done async to make sure the OCR is in place
+        if (!contactRequerySet.isEmpty()){
+            OpportunityRollups.rollupContactsandHouseholdsForTrigger(contactRequerySet);                        
+        }            
+    }       
+    
+    /*** Future Wrapper Methods for Handling Bulk Processing & Trigger Opps ***/
+    @future 
+    public static void rollupContactsandHouseholdsForTrigger(set<id> OppIds){
+        //we need this to make sure there's a proper OCR when Contact Opps are inserted
+        
+        map<id, Contact> cmap = new map<id, Contact>();
+        map<id, Household__c> hhmap = new map<id, Household__c>();
+        
+        // use the contact roles to find the contacts and households
+        for (OpportunityContactRole r : Database.query(OpportunityRollup_Utilities.buildOpportunityContactRoleQuery() +
+                                            ' where Opportunity.Id IN :OppIds and isPrimary = true ALL ROWS ')){   
+                    
+            cmap.put(r.ContactId, r.Contact);
+                
+            if (r.Contact.Household__c != null){
+                hhmap.put(r.Contact.Household__c, r.Contact.Household__r);
+            }
+        }       
+            
+        if (cmap.size() > 0){              
+            OpportunityRollups oppR = new OpportunityRollups();
+            oppR.rollupContacts(cmap);   
+            if (hhmap.size() > 0){
+                oppR.rollupHouseholds(hhmap);    
+            }        
+        }           
+    }
+    
+    @future 
+    public static void rollupAccountsFuture( set<id> acctIds ) {
+        if (acctIds != null && !acctIds.isEmpty()) { 
+            OpportunityRollups rg = new OpportunityRollups();
+            map<id, Account> amap = new map<id, account>((list<Account>)Database.query(OpportunityRollup_Utilities.buildAccountQuery() + 
+                                                           ' where id IN :acctIds')); 
+            rg.rollupAccounts(amap);
+        }
+    }    
+    @future
+    public static void rollupContactsFuture (set<id> conIDs){
+        if (conIds != null && !conIDs.isEmpty()){
+            OpportunityRollups rg = new OpportunityRollups();           
+            map<id, Contact> cmap = new map<id, Contact>((list<Contact>)Database.query(OpportunityRollup_Utilities.buildContactQuery() +
+                                                          ' where id IN :conIds'));
+            
+            rg.rollupContacts(cmap);
+        }       
+    }
+    @future
+    public static void rollupHouseholdsFuture (set<id> hhIDs){
+        if (hhIds != null && !hhIds.isEmpty()){
+            OpportunityRollups rg = new OpportunityRollups();
+            map<id, Household__c> hhmap = new map<id, Household__c>((list<Household__c>)Database.query(OpportunityRollup_Utilities.buildHouseholdQuery() +
+                                                                            ' where id IN :hhIDs'));
+            rg.rollupHouseholds(hhmap);                                                                         
+        }        
+    } 
+    /*************************************************************/
+
+    /*** Aggregate Query Rollup Methods ***/
+   
+    // roll up opps for a map of accounts
+    public void rollupAccounts(map<id, Account> amap) {
+
+        //arg used by multi currency for rollup field currencies
+        map<id,Opportunity> opptyCurrencies;
+        
+        // copy the accounts to a map of zerod out versions
+        map<id, Account> accountsToUpdate = new map<id, Account>();                
+        for (id aid : amap.keyset()){
+            accountsToUpdate.put(aid, new Account(id = aid, TotalOppAmount__c = 0, AverageAmount__c = 0, 
+                SmallestAmount__c = 0, LargestAmount__c = 0, FirstCloseDate__c = null,
+                LastCloseDate__c = null, NumberOfClosedOpps__c = 0, OppAmountThisYear__c = 0, 
+                OppsClosedThisYear__c = 0, OppAmountLastYear__c = 0, OppsClosedLastYear__c = 0,
+                OppsClosed2YearsAgo__c = 0, OppAmount2YearsAgo__c = 0,
+                OppsClosedLastNDays__c = 0, OppAmountLastNDays__c = 0, 
+                TotalMembershipOppAmount__c = 0, NumberOfMembershipOpps__c = 0,               
+                LastMembershipDate__c = null, LastMembershipAmount__c = 0,                
+                LastMembershipLevel__c = null, LastMembershipOrigin__c = null,                
+                MembershipJoinDate__c = null, MembershipEndDate__c = null,
+                LastOppAmount__c = null,
+                Best_Gift_Year__c = null, Best_Gift_Year_Total__c = 0                  
+            ));            
+            // map currency across if multicurrency
+            if(OpportunityRollup_Utilities.isMultiCurrency())
+                accountsToUpdate.get(aid).put(OpportunityRollup_Utilities.mcFieldValues.get('Account'),amap.get(aid).get(OpportunityRollup_Utilities.mcFieldValues.get('Account')));
+        }
+        
+        //need local vars b/c dynamic soql is stupid
+        set<id> aset = amap.keySet();
+        set<string> typeset = OpportunityRollup_Utilities.oppTypesToExcludeAccts;
+        set<id> rectypeset = OpportunityRollup_Utilities.recordTypesToExcludeAccts;
+
+        list<sobject> objectList = Database.query(OpportunityRollup_Utilities.buildAccountRollupQuery());
+
+        // invokes code to get the currency of CombinedRollupFieldset__c oppty
+        opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+        
+        for (sobject r : objectList){            
+            id aid = (id)(r.get('AccountId'));
+            if (aid != null){
+                updateRollupFromResult((sobject)(accountsToUpdate.get(aid)), r, opptyCurrencies);
+                
+                //calculate best gift year
+                decimal yrAmt = (decimal)r.get('TotalOppAmount');
+                integer yr = (integer)r.get('CalendarYr');
+                Account a = accountsToUpdate.get(aid);
+                if ((yrAmt > a.Best_Gift_Year_Total__c || a.Best_Gift_Year_Total__c==null ) && yr !=null){
+                    a.Best_Gift_Year_Total__c = yrAmt;
+                    a.Best_Gift_Year__c = string.valueOf(yr);
+                }          
+            }   
+        }       
+        
+        objectList.clear();
+        objectList = database.query(OpportunityRollup_Utilities.buildAccountNDayQuery());
+        
+        for (sobject r : objectList){
+            id aid = (id)(r.get('AccountId'));
+            if (aid != null)
+                updateRollupFromResultLastNDays((sobject)(accountsToUpdate.get(aid)), r);
+        }
+
+        if (!OpportunityRollup_Utilities.mbrRecordTypes.isEmpty()) {
+            set<id> memberset = OpportunityRollup_Utilities.mbrRecordTypes; 
+            objectList.clear();
+            objectList = database.query(OpportunityRollup_Utilities.buildAccountMembershipQuery());        
+            
+            opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+   
+            for (sobject r : objectList){                
+                id aid = (id)(r.get('AccountId'));
+                if (aid != null)
+                    updateRollupFromResultMembership((sobject)(accountsToUpdate.get(aid)), r, opptyCurrencies);
+            }
+        }
+
+        // remove any records that have not changed
+        for (id aid : amap.keySet()) {
+            account a1 = amap.get(aid); 
+            account a2 = accountsToUpdate.get(aid);
+            
+            if (a1.TotalOppAmount__c == a2.TotalOppAmount__c &&
+                    a1.OppsClosedThisYear__c == a2.OppsClosedThisYear__c &&
+                    a1.OppsClosedLastYear__c == a2.OppsClosedLastYear__c &&
+                    a1.OppsClosedLastNDays__c == a2.OppsClosedLastNDays__c &&
+                    a1.OppsClosed2YearsAgo__c == a2.OppsClosed2YearsAgo__c &&
+                    a1.OppAmountLastYear__c == a2.OppAmountLastYear__c &&
+                    a1.OppAmount2YearsAgo__c == a2.OppAmount2YearsAgo__c &&                      
+                    a1.OppAmountThisYear__c == a2.OppAmountThisYear__c &&
+                    a1.OppAmountLastNDays__c == a2.OppAmountLastNDays__c &&
+                    a1.TotalMembershipOppAmount__c == a2.TotalMembershipOppAmount__c &&
+                    a1.LastCloseDate__c == a2.LastCloseDate__c && 
+                    a1.LastMembershipLevel__c == a2.LastMembershipLevel__c &&
+                    a1.Best_Gift_Year__c == a2.Best_Gift_Year__c &&
+                    a1.Best_Gift_Year_Total__c == a2.Best_Gift_Year_Total__c
+                    )
+            accountsToUpdate.remove(aid);
+        }         
+        
+        Database.SaveResult[] SR = database.update(accountsToUpdate.values(), false);                
+        List<Opportunity_Rollup_Error__c> elist = new List<Opportunity_Rollup_Error__c>();
+        integer i = 0;
+        for(Database.SaveResult s: SR){
+            if (!s.isSuccess()){
+                elist.add(OpportunityRollup_Utilities.createError(s, 'Account', accountsToUpdate.values()[i].id));                              
+            }
+            i++;
+        }        
+        if(!elist.isEmpty()){
+            insert elist;
+        }           
+    }    
+    
+    //rollup Opps for a map of Contacts
+    public void rollupContacts(map<id, Contact> cmap){
+        //arg used by multi currency for rollup field currencies
+        map<Id,Opportunity> opptyCurrencies;
+        // copy the contacts to a map of zeroed out versions
+        map<id, Contact> contactsToUpdate = new map<id, Contact>();
+        
+        for (id cid : cmap.keySet()) {
+            contactsToUpdate.put(cid, new Contact(id = cid, TotalOppAmount__c = 0, AverageAmount__c = 0, 
+                SmallestAmount__c = 0, LargestAmount__c = 0, FirstCloseDate__c = null, 
+                LastCloseDate__c = null, NumberOfClosedOpps__c = 0, OppAmountThisYear__c = 0, 
+                OppsClosedThisYear__c = 0, OppAmountLastYear__c = 0, OppsClosedLastYear__c = 0,
+                OppsClosed2YearsAgo__c = 0, OppAmount2YearsAgo__c = 0, 
+                OppsClosedLastNDays__c = 0, OppAmountLastNDays__c = 0,
+                TotalMembershipOppAmount__c = 0, NumberOfMembershipOpps__c = 0,               
+                LastMembershipDate__c = null, LastMembershipAmount__c = 0,                
+                LastMembershipLevel__c = null, LastMembershipOrigin__c = null,                
+                MembershipJoinDate__c = null, MembershipEndDate__c = null,                
+                LastOppAmount__c = null, 
+                Best_Gift_Year__c = null, Best_Gift_Year_Total__c = 0
+            ));
+            // map currency across if multicurrency
+            if(OpportunityRollup_Utilities.isMultiCurrency())
+                contactsToUpdate.get(cid).put(OpportunityRollup_Utilities.mcFieldValues.get('Contact'),cmap.get(cid).get(OpportunityRollup_Utilities.mcFieldValues.get('Contact')));            
+        }
+    
+        list<sobject> objectList = new list<sobject>();   
+        set<id> cset = cmap.keySet();
+        set<string> typeset = OpportunityRollup_Utilities.oppTypesToExcludeCons;
+        set<id> rectypeset = OpportunityRollup_Utilities.recordTypesToExcludeCons;
+        
+        objectList = database.query(OpportunityRollup_Utilities.buildContactRollupQuery());
+            
+        // invokes code to get the currency of CombinedRollupFieldset__c oppty
+        opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+            
+        for (sobject r : objectList) {
+            id cid = (id)(r.get('ContactId'));
+            if (cid != null){
+                updateRollupFromResult((sobject)(contactsToUpdate.get(cid)), r, opptyCurrencies);
+                
+                //calculate best gift year
+                decimal yrAmt = (decimal)r.get('TotalOppAmount');
+                integer yr = (integer)r.get('CalendarYr');
+                Contact c = contactsToUpdate.get(cid);
+                if ((yrAmt > c.Best_Gift_Year_Total__c || c.Best_Gift_Year_Total__c==null ) && yr !=null){
+                    c.Best_Gift_Year_Total__c = yrAmt;
+                    c.Best_Gift_Year__c = string.valueOf(yr);
+                }          
+            }                
+        }        
+        
+        objectList.clear();
+        objectList = database.query(OpportunityRollup_Utilities.buildContactNDayQuery());
+        
+        for (sobject r : objectList){
+            id cid = (id)(r.get('ContactId'));
+            if (cid != null)
+                updateRollupFromResultLastNDays((sobject)(contactsToUpdate.get(cid)), r);
+        }
+
+        if (!OpportunityRollup_Utilities.mbrRecordTypes.isEmpty()){
+        	set<id> memberset = OpportunityRollup_Utilities.mbrRecordTypes;
+            objectList.clear();
+            objectList = database.query(OpportunityRollup_Utilities.buildContactMembershipQuery());        
+            
+            opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+   
+            for (sobject r : objectList){                
+                id cid = (id)(r.get('ContactId'));
+                if (cid != null)
+                    updateRollupFromResultMembership((sobject)(contactsToUpdate.get(cid)), r, opptyCurrencies);
+            }
+        }        
+        
+        for (id cid : cmap.keySet()) {
+            contact c1 = cmap.get(cid);
+            contact c2 = contactsToUpdate.get(cid);
+            
+            if (c1.TotalOppAmount__c == c2.TotalOppAmount__c &&
+                    c1.OppAmountLastYear__c == c2.OppAmountLastYear__c && 
+                    c1.OppAmount2YearsAgo__c == c2.OppAmount2YearsAgo__c &&
+                    c1.OppAmountLastNDays__c == c2.OppAmountLastNDays__c &&
+                    c1.OppAmountThisYear__c == c2.OppAmountThisYear__c &&
+                    c1.TotalMembershipOppAmount__c == c2.TotalMembershipOppAmount__c &&
+                    c1.LastCloseDate__c == c2.LastCloseDate__c &&
+                    c1.MembershipEndDate__c == c2.MembershipEndDate__c &&
+                    c1.MembershipJoinDate__c == c2.MembershipJoinDate__c &&
+                    c1.LastMembershipLevel__c == c2.LastMembershipLevel__c &&
+                    c1.Best_Gift_Year__c == c2.Best_Gift_Year__c &&
+                    c1.Best_Gift_Year_Total__c == c2.Best_Gift_Year_Total__c
+                    )
+                contactsToUpdate.remove(cid);
+        }
+        
+        Database.SaveResult[] SR = database.update(contactsToUpdate.values(), false);
+        List<Opportunity_Rollup_Error__c> elist = new List<Opportunity_Rollup_Error__c>();
+        //needed to match errors to update list index
+        integer i = 0;
+        for(Database.SaveResult s: SR){        	
+            if (!s.isSuccess()){
+                elist.add(OpportunityRollup_Utilities.createError(s, 'Contact', contactsToUpdate.values()[i].id));                              
+            }
+            i++;
+        }        
+        if(!elist.isEmpty()){
+            insert elist;
+        }
+    }    
+    
+    public void rollupHouseholds(map<id, Household__c> hhmap){
+        
+        //arg used by multi currency for rollup field currencies
+        map<Id,Opportunity> opptyCurrencies;
+        // copy the contacts and households to a map of zerod out versions
+        map<id, Household__c> householdsToUpdate = new map<id, Household__c>();
+        
+        for (id hhid : hhmap.keySet()) {
+            householdsToUpdate.put(hhid, new Household__c(id = hhid, TotalOppAmount__c = 0, AverageAmount__c = 0, 
+                SmallestAmount__c = 0, LargestAmount__c = 0, FirstCloseDate__c = null, 
+                LastCloseDate__c = null, NumberOfClosedOpps__c = 0, OppAmountThisYear__c = 0, 
+                OppsClosedThisYear__c = 0, OppAmountLastYear__c = 0, OppsClosedLastYear__c = 0,
+                OppsClosed2YearsAgo__c = 0, OppAmount2YearsAgo__c = 0, 
+                OppsClosedLastNDays__c = 0, OppAmountLastNDays__c = 0,
+                TotalMembershipOppAmount__c = 0, NumberOfMembershipOpps__c = 0,               
+                LastMembershipDate__c = null, LastMembershipAmount__c = 0,                
+                LastMembershipLevel__c = null, LastMembershipOrigin__c = null,                
+                MembershipJoinDate__c = null, MembershipEndDate__c = null,                
+                LastOppAmount__c = null,
+                Best_Gift_Year__c = null, Best_Gift_Year_Total__c = 0
+            ));
+            
+            // map currency across if multicurrency
+            if(OpportunityRollup_Utilities.isMultiCurrency())
+                householdsToUpdate.get(hhid).put(OpportunityRollup_Utilities.mcFieldValues.get('Household__c'),hhmap.get(hhid).get(OpportunityRollup_Utilities.mcFieldValues.get('Household__c')));
+                        
+        }
+    
+        list<sobject> objectList = new list<sobject>();   
+        set<id> hhset = hhmap.keySet();
+        set<string> typeset = OpportunityRollup_Utilities.oppTypesToExcludeCons;
+        set<id> rectypeset = OpportunityRollup_Utilities.recordTypesToExcludeCons;
+        
+        objectList = database.query(OpportunityRollup_Utilities.buildHouseholdRollupQuery());
+            
+        // invokes code to get the currency of CombinedRollupFieldset__c oppty
+        opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+            
+        for (sobject r : objectList) {
+            id hhid = (id)(r.get('hhid'));
+            if (hhid != null){
+                updateRollupFromResult((sobject)(householdsToUpdate.get(hhid)), r, opptyCurrencies);
+            
+                //calculate best gift year
+                decimal yrAmt = (decimal)r.get('TotalOppAmount');
+                integer yr = (integer)r.get('CalendarYr');
+                Household__c hh = householdsToUpdate.get(hhid);
+                if ((yrAmt > hh.Best_Gift_Year_Total__c || hh.Best_Gift_Year_Total__c==null ) && yr !=null){
+                    hh.Best_Gift_Year_Total__c = yrAmt;
+                    hh.Best_Gift_Year__c = string.valueOf(yr);
+                }                
+            }                
+        }        
+        
+        objectList.clear();
+        objectList = database.query(OpportunityRollup_Utilities.buildHouseholdNDayQuery());
+        
+        for (sobject r : objectList){
+            id hhid = (id)(r.get('hhid'));
+            if (hhid != null)
+                updateRollupFromResultLastNDays((sobject)(householdsToUpdate.get(hhid)), r);
+        }
+
+        if (!OpportunityRollup_Utilities.mbrRecordTypes.isEmpty()){
+        	set<id> memberset = OpportunityRollup_Utilities.mbrRecordTypes;
+            objectList.clear();
+            objectList = database.query(OpportunityRollup_Utilities.buildHouseholdMembershipQuery());        
+            
+            opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+   
+            for (sobject r : objectList){                
+                id hhid = (id)(r.get('hhid'));
+                if (hhid != null)
+                    updateRollupFromResultMembership((sobject)(householdsToUpdate.get(hhid)), r, opptyCurrencies);
+            }
+        }        
+        
+        for (id hhid : hhmap.keySet()) {
+            Household__c h1 = hhmap.get(hhid);
+            Household__c h2 = householdsToUpdate.get(hhid);
+            
+            if (h1.TotalOppAmount__c == h2.TotalOppAmount__c &&
+                    h1.OppAmountLastYear__c == h2.OppAmountLastYear__c && 
+                    h1.OppAmount2YearsAgo__c == h2.OppAmount2YearsAgo__c &&
+                    h1.OppAmountLastNDays__c == h2.OppAmountLastNDays__c &&
+                    h1.OppAmountThisYear__c == h2.OppAmountThisYear__c &&
+                    h1.TotalMembershipOppAmount__c == h2.TotalMembershipOppAmount__c &&
+                    h1.LastCloseDate__c == h2.LastCloseDate__c &&
+                    h1.MembershipEndDate__c == h2.MembershipEndDate__c &&
+                    h1.MembershipJoinDate__c == h2.MembershipJoinDate__c &&
+                    h1.LastMembershipLevel__c == h2.LastMembershipLevel__c &&
+                    h1.Best_Gift_Year__c == h2.Best_Gift_Year__c &&
+                    h1.Best_Gift_Year_Total__c == h2.Best_Gift_Year_Total__c
+                    )
+                householdsToUpdate.remove(hhid);
+        }
+        
+        Database.SaveResult[] SR = database.update(householdsToUpdate.values(), false);
+        List<Opportunity_Rollup_Error__c> elist = new List<Opportunity_Rollup_Error__c>();
+        integer i = 0;
+        for(Database.SaveResult s: SR){
+            if (!s.isSuccess()){
+                elist.add(OpportunityRollup_Utilities.createError(s, 'Household', householdsToUpdate.values()[i].id));                              
+            }
+            i++;
+        }        
+        if(!elist.isEmpty()){
+            insert elist;
+        }
+    }  
+    
+    public void rollupSoftCredits(map<id, Contact> cmap){      
+        //arg used by multi currency for rollup field currencies
+        map<Id,Opportunity> opptyCurrencies;
+        // copy the contacts to a zeroed out version
+        map<id, Contact> contactsToUpdate = new map<id, Contact>();        
+        
+        for (id cid : cmap.keySet()) {
+            contactsToUpdate.put(cid, new Contact(id = cid,                 
+                Soft_Credit_This_Year__c = 0, Soft_Credit_Last_Year__c = 0,                
+                Soft_Credit_Two_Years_Ago__c = 0, Soft_Credit_Total__c = 0
+            ));
+            // map currency across if multicurrency
+            if(OpportunityRollup_Utilities.isMultiCurrency())
+                contactsToUpdate.get(cid).put(OpportunityRollup_Utilities.mcFieldValues.get('Contact'),cmap.get(cid).get(OpportunityRollup_Utilities.mcFieldValues.get('Contact')));            
+        }
+    
+        list<sobject> objectList = new list<sobject>();   
+        set<id> cset = cmap.keySet();        
+        set<string> softCreditRoles = OpportunityRollup_Utilities.softCreditRoles;
+        
+        objectList = database.query(OpportunityRollup_Utilities.buildSoftCreditQuery());
+            
+        // invokes code to get the currency of CombinedRollupFieldset__c oppty
+        opptyCurrencies = (OpportunityRollup_Utilities.isMultiCurrency() ? OpportunityRollup_Utilities.rcfFindCurrency(objectList) : null);
+            
+        for (sobject r : objectList) {
+            id cid = (id)(r.get('ContactId'));
+            if (cid != null){
+                updateSoftCreditFromResult((sobject)(contactsToUpdate.get(cid)), r, opptyCurrencies);
+            }                
+        }                
+        for (id cid : cmap.keySet()) {
+            contact c1 = cmap.get(cid);
+            contact c2 = contactsToUpdate.get(cid);
+            
+            if (c1.Soft_Credit_This_Year__c == c2.Soft_Credit_This_Year__c &&
+                c1.Soft_Credit_Last_Year__c == c2.Soft_Credit_Last_Year__c &&
+                c1.Soft_Credit_Two_Years_Ago__c == c2.Soft_Credit_Two_Years_Ago__c && 
+                c1.Soft_Credit_Total__c == c2.Soft_Credit_Total__c)
+                contactsToUpdate.remove(cid);
+        }
+        
+        Database.SaveResult[] SR = database.update(contactsToUpdate.values(), false);
+        List<Opportunity_Rollup_Error__c> elist = new List<Opportunity_Rollup_Error__c>();
+        //needed to match errors to update list index
+        integer i = 0;
+        for(Database.SaveResult s: SR){         
+            if (!s.isSuccess()){
+                elist.add(OpportunityRollup_Utilities.createError(s, 'Contact', contactsToUpdate.values()[i].id));                              
+            }
+            i++;
+        }        
+        if(!elist.isEmpty()){
+            insert elist;
+        }    	
+    }
+       
+    /*************************************************************/
+    
+    /*** Wrappers for Managing the batch process ***/
+    public void rollupAll(){
+    	//clear the error queue from any previous runs
+        delete [select id from Opportunity_Rollup_Error__c];
+        
+        rollupAllAccounts();
+        rollupAllContacts(); 
+        rollupAllHouseholds();        
+        
+        system.debug(OpportunityRollup_Utilities.hh_settings.Enable_Soft_Credit_Rollups__c);
+        if (OpportunityRollup_Utilities.useSoftCredits()){ 
+        	rollupAllSoftCredits();
+        }            
+    }
+    public void rollupAllHouseholds(){
+        BATCH_OppRollup batch = new BATCH_OppRollup(OpportunityRollup_Utilities.buildHouseholdQuery(), BATCH_OppRollup.BATCH_TYPE.HouseholdType);
+        id batchProcessId = database.executeBatch(batch, OpportunityRollup_Utilities.BATCH_SIZE);
+    }
+    public void rollupAllAccounts() {
+        BATCH_OppRollup batch = new BATCH_OppRollup(OpportunityRollup_Utilities.buildAccountQuery(), BATCH_OppRollup.BATCH_TYPE.AccountType);
+        id batchProcessId = database.executeBatch(batch, OpportunityRollup_Utilities.BATCH_SIZE);        
+    }           
+    public void rollupAllContacts() { 
+        BATCH_OppRollup batch = new BATCH_OppRollup(OpportunityRollup_Utilities.buildContactQuery(), BATCH_OppRollup.BATCH_TYPE.ContactType);
+        id batchProcessId = database.executeBatch(batch, OpportunityRollup_Utilities.BATCH_SIZE);        
+    }
+    public void rollupAllSoftCredits(){
+    	BATCH_OppRollup batch = new BATCH_OppRollup(OpportunityRollup_Utilities.buildContactQuery(), BATCH_OppRollup.BATCH_TYPE.SoftCreditType);
+        id batchProcessId = database.executeBatch(batch, OpportunityRollup_Utilities.BATCH_SIZE);
+    } 
+    /*************************************************************/
+    
+    /*** Methods for writing from aggregate results to objects ***/    
+    public static void updateRollupFromResult(sobject obj, sobject r, map<id, Opportunity> opptyCurrencies) {
+       // get the fiscal year, total amount, and opp count for this result row     
+        integer fy = (integer)(r.get('CalendarYr'));
+        decimal amt = (decimal)(r.get('TotalOppAmount'));
+        integer cnt = (integer)(r.get('NumberOfClosedOpps'));               
+        
+        // split the special field to get the last opp id and amount
+        string[] rcf = ((string)(r.get('RollupFieldset'))).split(';\\|;',-4);
+        decimal lastAmt = (rcf.size() > 1 && rcf[1] != '') ? decimal.valueOf(rcf[1]) : null;
+        
+        // calculate amounts into correct currency if needed
+        if(OpportunityRollup_Utilities.isMultiCurrency()){
+            amt = OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),amt);
+            if(lastAmt != null && rcf.size() > 4 && rcf[4] != '')
+                lastAmt = OpportunityRollup_Utilities.ConvertCurrency((string)opptyCurrencies.get((Id)rcf[4]).get('CurrencyISOCode'),(string)obj.get('CurrencyIsoCode'),lastAmt);           
+        }
+        
+        // check if this is an annual total or account total
+        if (fy != null){
+
+            // put the fiscal year total in the right fields
+            integer thisYear;
+            if (OpportunityRollup_Utilities.useFiscalYear)
+                thisYear = OpportunityRollup_Utilities.getCurrentFY();
+            else
+                thisYear = system.today().year();
+            
+            if (fy == thisYear){
+                obj.put('OppAmountThisYear__c', amt); 
+                obj.put('OppsClosedThisYear__c', cnt); 
+            } 
+            else if (fy == (thisYear - 1)){
+                obj.put('OppAmountLastYear__c', amt); 
+                obj.put('OppsClosedLastYear__c', cnt); 
+            }
+            else if (fy == (thisYear - 2) ){
+                obj.put('OppAmount2YearsAgo__c', amt); 
+                obj.put('OppsClosed2YearsAgo__c', cnt); 
+            } 
+                
+        } 
+        else { 
+            // fill in summary totals
+            obj.put('TotalOppAmount__c', amt);
+            obj.put('NumberOfClosedOpps__c', cnt);               
+            obj.put('LastOppAmount__c', lastAmt);
+            obj.put('FirstCloseDate__c', r.get('FirstCloseDate')); //date
+            obj.put('LastCloseDate__c', r.get('LastCloseDate')); //date
+            
+            // calculate amounts into correct currency if needed
+            if(OpportunityRollup_Utilities.isMultiCurrency()){
+               obj.put('AverageAmount__c', OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),(decimal)r.get('AverageAmount'))); 
+               obj.put('SmallestAmount__c', OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),(decimal)r.get('SmallestAmount'))); 
+               obj.put('LargestAmount__c', OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),(decimal)r.get('LargestAmount'))); 
+            }
+            else{
+               obj.put('AverageAmount__c', (decimal)(r.get('AverageAmount'))); 
+               obj.put('SmallestAmount__c', (decimal)(r.get('SmallestAmount'))); 
+               obj.put('LargestAmount__c', (decimal)(r.get('LargestAmount'))); 
+            }
+        }
+        
+        //deal with user rollups
+        if (OpportunityRollup_Utilities.urfsMap.size() > 0){
+            for (string s : OpportunityRollup_Utilities.urfsMap.keyset()){
+                if (obj.getSObjectType().getDescribe().getName() == OpportunityRollup_Utilities.urfsMap.get(s).Object_Name__c){
+                    User_Rollup_Field_Settings__c urfs = OpportunityRollup_Utilities.urfsMap.get(s);
+                    string x = urfs.Name;                   
+                    if (r.get(x) != null)
+                       obj.put(urfs.Target_Field__c, r.get(x));
+                }
+            }
+        } 
+    }
+
+    public static void updateRollupFromResultLastNDays(sobject obj, sobject r){
+           
+        // get the fiscal year, total amount, and opp count for this result row     
+        decimal amt = (decimal)(r.get('TotalOppAmount'));
+        integer cnt = (integer)(r.get('NumberOfClosedOpps'));               
+        
+        // calculate amounts into correct currency if needed
+        if(OpportunityRollup_Utilities.isMultiCurrency())
+           amt = OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),amt);
+        
+        obj.put('OppAmountLastNDays__c', amt);               
+        obj.put('OppsClosedLastNDays__c', cnt);
+    }
+
+    public static void updateRollupFromResultMembership(sobject obj, sobject r, map<id, Opportunity> opptyCurrencies){
+    // used for single and batch rollups, this maps query results to the right fields
+        
+        // get the fiscal year, total amount, and opp count for this result row
+        decimal amt = (decimal)(r.get('TotalOppAmount'));
+        integer cnt = (integer)(r.get('NumberOfClosedOpps'));               
+
+        // split the special field to get the last opp id and amount
+        string[] rcf = ((string)(r.get('RollupFieldset'))).split(';\\|;',-4);
+        decimal lastAmt = (rcf.size() > 1 && rcf[1] != null) ? decimal.valueOf(rcf[1]) : null;
+        string lastMemberLevel = (rcf.size() > 2) ? rcf[2] : null;
+        string lastMemberOrigin = (rcf.size() > 3) ? rcf[3] : null;
+        // calculate amounts into correct currency if needed
+        if(OpportunityRollup_Utilities.isMultiCurrency()){
+           amt = OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),amt);
+           if(lastAmt != null && rcf.size() > 4 && rcf[4] != '')
+               lastAmt = OpportunityRollup_Utilities.ConvertCurrency((string)opptyCurrencies.get((Id)rcf[4]).get('CurrencyISOCode'),(string)obj.get('CurrencyIsoCode'),lastAmt);           
+        }
+
+        // fill in summary totals
+        obj.put('TotalMembershipOppAmount__c', amt);
+        obj.put('NumberOfMembershipOpps__c', cnt);               
+        obj.put('LastMembershipDate__c', (date)(r.get('LastCloseDate')));                
+        obj.put('LastMembershipAmount__c', lastAmt);                 
+        obj.put('LastMembershipLevel__c', lastMemberLevel);              
+        obj.put('LastMembershipOrigin__c', lastMemberOrigin);                
+        obj.put('MembershipJoinDate__c', (date)(r.get('FirstStartDate'))); 
+        obj.put('MembershipEndDate__c', (date)(r.get('LastEndDate')));
+    }   
+    
+    public static void updateSoftCreditFromResult(sobject obj, sobject r, map<id, Opportunity> opptyCurrencies){
+    	 // get the fiscal year, total amount, and opp count for this result row     
+        integer fy = (integer)(r.get('CalendarYr'));
+        decimal amt = (decimal)(r.get('TotalOppAmount'));                       
+        
+        // calculate amounts into correct currency if needed
+        if(OpportunityRollup_Utilities.isMultiCurrency())
+            amt = OpportunityRollup_Utilities.ConvertFromCorporate((string)obj.get('CurrencyIsoCode'),amt);
+        
+        // check if this is an annual total or account total
+        if (fy != null){
+
+            // put the fiscal year total in the right fields
+            integer thisYear;
+            if (OpportunityRollup_Utilities.useFiscalYear)
+                thisYear = OpportunityRollup_Utilities.getCurrentFY();
+            else
+                thisYear = system.today().year();
+            
+            if (fy == thisYear)
+                obj.put('Soft_Credit_This_Year__c', amt); 
+                 
+            else if (fy == (thisYear - 1))
+                obj.put('Soft_Credit_Last_Year__c', amt); 
+                 
+            else if (fy == (thisYear - 2))
+                obj.put('Soft_Credit_Two_Years_Ago__c', amt);    
+        }
+        else { 
+            // fill in summary totals
+            obj.put('Soft_Credit_Total__c', amt);        
+        }
+    }
+    
+    /*************************************************************/ 
+}
